@@ -19,12 +19,23 @@ images:
       as:
       - registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.22-openshift-4.17
   to: ptp-operator
+- dockerfile_path: Dockerfile
+  inputs:
+    ocp_4.17_base-rhel9:
+      as:
+      - registry.ci.openshift.org/ocp/4.17:base-rhel9
+    ocp_builder_rhel-9-golang-1.22-openshift-4.17:
+      as:
+      - registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.22-openshift-4.17
+  to: ptp
 operator:
   bundles:
   - dockerfile_path: bundleci.Dockerfile
   substitutions:
-  - pullspec: quay.io/openshift/origin-ptp-operator:4.17
+  - pullspec: quay.io/openshift/origin-ptp-operator:*
     with: pipeline:ptp-operator
+  - pullspec: quay.io/openshift/origin-ptp:*
+    with: pipeline:ptp
 promotion:
   to:
   - name: ptp-4.17
