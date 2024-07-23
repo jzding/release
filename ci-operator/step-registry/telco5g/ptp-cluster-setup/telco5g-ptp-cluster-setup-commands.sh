@@ -32,7 +32,7 @@ export KCLI_PARAM="-P tag=${T5CI_VERSION} -P version=nightly"
 echo "${CLUSTER_NAME}" > ${ARTIFACT_DIR}/job-cluster
 #Check connectivity
 ping ${CLUSTER_HV_IP} -c 10 || true
-echo "exit" | curl telnet://${CLUSTER_HV_IP}:22 && echo "SSH port is opened"|| echo "status = $?"
+echo "exit" | ncat ${CLUSTER_HV_IP} 22 && echo "SSH port is opened"|| echo "status = $?"
 
 #Create inventory file
 cat << EOF > $SHARED_DIR/inventory
@@ -155,7 +155,7 @@ cat << EOF > ~/fetch-kubeconfig.yml
       regexp: '    server: https://api.*'
       replace: "    server: https://${CLUSTER_API_IP}:${CLUSTER_API_PORT}"
     delegate_to: localhost
-    
+
   - name: Add docker auth to enable pulling containers from CI registry
     shell: >-
       kcli ssh root@${CLUSTER_NAME}-installer
