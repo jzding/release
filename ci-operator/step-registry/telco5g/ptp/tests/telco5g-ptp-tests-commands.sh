@@ -522,6 +522,156 @@ for mode in "${TEST_MODES[@]}"; do
   fi
 done
 
+# --- TLS Scanner (scoped to openshift-ptp, 4.22+ only) ---
+if [[ -n "${T5CI_VERSION}" ]] && [[ "$T5CI_VERSION" =~ ^(4\.(2[2-9]|[3-9][0-9])|[5-9]\.) ]]; then
+  echo "Running TLS scanner against openshift-ptp namespace..."
+  tls_scan_failed=0
+  TLS_NS="tls-scanner"
+  TLS_SCANNER_SRC="quay.io/openshift/tls-scanner:latest"
+  TLS_SCANNER_IMG="${REGISTRY}/openshift-ptp/tls-scanner:latest"
+
+  oc delete namespace "${TLS_NS}" --ignore-not-found --wait=true --timeout=120s || true
+
+  if ! oc create namespace "${TLS_NS}"; then
+    echo "ERROR: failed to create ${TLS_NS} namespace"
+    tls_scan_failed=1
+  fi
+
+  if [[ $tls_scan_failed -eq 0 ]]; then
+    # Mirror tls-scanner image to internal registry using a podman pod
+    # (same pattern as build_images — quay.io/podman/stable is public)
+    oc get secret pull-secret --namespace=openshift-config -oyaml \
+      | grep -v '^\s*namespace:\s' | oc apply --namespace="${TLS_NS}" -f - || true
+
+    echo "Mirroring ${TLS_SCANNER_SRC} to ${TLS_SCANNER_IMG}..."
+    oc run tls-mirror --image=quay.io/podman/stable:v4.9.4 -n "${TLS_NS}" \
+      --restart=Never --overrides='{
+        "spec": {
+          "containers": [{
+            "name": "tls-mirror",
+            "image": "quay.io/podman/stable:v4.9.4",
+            "command": ["/bin/bash", "-c",
+              "set -xe; podman pull --authfile /var/run/secrets/openshift.io/pull/.dockercfg '"${TLS_SCANNER_SRC}"' || podman pull '"${TLS_SCANNER_SRC}"'; podman tag '"${TLS_SCANNER_SRC}"' '"${TLS_SCANNER_IMG}"'; podman push --tls-verify=false '"${TLS_SCANNER_IMG}"'; echo MIRROR_DONE"],
+            "volumeMounts": [{"name": "pull-secret", "mountPath": "/var/run/secrets/openshift.io/pull"}],
+            "securityContext": {"privileged": true}
+          }],
+          "volumes": [{"name": "pull-secret", "secret": {"secretName": "pull-secret"}}],
+          "restartPolicy": "Never"
+        }
+      }' --command -- /bin/true 2>/dev/null || true
+
+    # Wait for mirror pod to complete
+    oc wait pod/tls-mirror -n "${TLS_NS}" --for=jsonpath='{.status.phase}'=Succeeded --timeout=300s 2>/dev/null || {
+      echo "WARNING: tls-scanner image mirror failed, trying source image directly"
+      TLS_SCANNER_IMG="${TLS_SCANNER_SRC}"
+    }
+    oc delete pod/tls-mirror -n "${TLS_NS}" --ignore-not-found || true
+
+    TLS_SCANNER_SA="tls-scanner-sa"
+    TLS_SCANNER_CRB="tls-scanner-cluster-admin"
+    oc create serviceaccount "${TLS_SCANNER_SA}" -n "${TLS_NS}"
+    oc create clusterrolebinding "${TLS_SCANNER_CRB}" \
+      --clusterrole=cluster-admin \
+      --serviceaccount="${TLS_NS}:${TLS_SCANNER_SA}"
+    sleep 5
+
+    if ! cat <<SCANEOF | oc create -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tls-scanner
+  namespace: ${TLS_NS}
+spec:
+  serviceAccountName: ${TLS_SCANNER_SA}
+  restartPolicy: Never
+  containers:
+  - name: scanner
+    image: ${TLS_SCANNER_IMG}
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      SCAN_EXIT_CODE=0
+      /usr/local/bin/tls-scanner -j 4 --all-pods --namespace-filter openshift-ptp \
+        --json-file /results/results.json \
+        --csv-file /results/results.csv \
+        --junit-file /results/junit_tls_scan.xml \
+        --log-file /results/scan.log 2>&1 | tee /results/output.log || SCAN_EXIT_CODE=\$?
+      touch /results/scan.done
+      sleep 120
+      exit \${SCAN_EXIT_CODE}
+    resources:
+      requests:
+        cpu: "2"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+    volumeMounts:
+    - name: results
+      mountPath: /results
+  volumes:
+  - name: results
+    emptyDir: {}
+SCANEOF
+    then
+      echo "ERROR: failed to create tls-scanner pod"
+      tls_scan_failed=1
+    fi
+  fi
+
+  if [[ $tls_scan_failed -eq 0 ]]; then
+    if ! oc wait pod/tls-scanner -n "${TLS_NS}" --for=condition=Ready --timeout=300s; then
+      echo "ERROR: tls-scanner pod failed to start"
+      oc describe pod/tls-scanner -n "${TLS_NS}" || true
+      tls_scan_failed=1
+    else
+      scan_timeout=1800
+      elapsed=0
+      while (( elapsed < scan_timeout )); do
+        if oc exec pod/tls-scanner -n "${TLS_NS}" -- test -f /results/scan.done 2>/dev/null; then
+          echo "TLS scan completed (scan.done found)"
+          break
+        fi
+        phase=$(oc get pod/tls-scanner -n "${TLS_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        if [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]]; then
+          echo "TLS scanner pod exited with phase: ${phase}"
+          break
+        fi
+        sleep 15
+        (( elapsed += 15 )) || true
+      done
+      if (( elapsed >= scan_timeout )); then
+        echo "ERROR: tls-scanner timed out after ${scan_timeout}s"
+        tls_scan_failed=1
+      fi
+    fi
+  fi
+
+  # Always attempt artifact collection
+  mkdir -p "${ARTIFACT_DIR}/tls-scan"
+  oc cp "${TLS_NS}/tls-scanner:/results/." "${ARTIFACT_DIR}/tls-scan/" 2>/dev/null || true
+  if [[ -f "${ARTIFACT_DIR}/tls-scan/junit_tls_scan.xml" ]]; then
+    cp "${ARTIFACT_DIR}/tls-scan/junit_tls_scan.xml" "${ARTIFACT_DIR}/junit_tls_scan.xml"
+  else
+    echo "WARNING: junit_tls_scan.xml not found after scan"
+    tls_scan_failed=1
+  fi
+
+  # Always clean up
+  oc delete clusterrolebinding "${TLS_SCANNER_CRB:-tls-scanner-cluster-admin}" --ignore-not-found || true
+  oc delete namespace "${TLS_NS}" --ignore-not-found --wait=false || true
+
+  if [[ $tls_scan_failed -ne 0 ]]; then
+    echo "ERROR: TLS scan failed (see above). Continuing with undeploy."
+    status=1
+  else
+    echo "TLS scan passed. Results in ${ARTIFACT_DIR}/tls-scan/"
+  fi
+else
+  echo "Skipping TLS scan (requires version >= 4.22, current: ${T5CI_VERSION:-unset})"
+fi
+# --- End TLS Scanner ---
+
 # allows commands to fail without returning
 set +e
 
